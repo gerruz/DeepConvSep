@@ -4,7 +4,7 @@
     Copyright (c) 2014-2017 Marius Miron  <miron.marius at gmail.com>
 
     DeepConvSep is free software: you can redistribute it and/or modify
-    it under the terms of the Affero GPL License as published by
+    it under the terms of the Afero GPL License as published by
     the Free Software Foundation, either version 3 of the License, or
     (at your option) any later version.
 
@@ -13,7 +13,7 @@
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
-    You should have received a copy of the Affero GPL License
+    You should have received a copy of the Afero GPL License
     along with DeepConvSep.  If not, see <http://www.gnu.org/licenses/>.
  """
 
@@ -37,7 +37,7 @@ SEMITONE_RATIO = 2. ** (1. / 12.) # Ascending
 
 
 class Engine(object):
-    def __init__(self,db,feature_path,instruments,allowed_styles,allowed_dynamics,allowed_case,time_shifts,rwc_path,chunk_size,sample_size,style,style_midi):
+    def __init__(self,db,feature_path,instruments,allowed_styles,allowed_dynamics,allowed_case,time_shifts,rwc_path,chunk_size,sample_size,style,style_midi,nharmonics,interval,tuning_freq):
 
       self.allowed_styles = allowed_styles
       self.allowed_dynamics = allowed_dynamics
@@ -54,6 +54,10 @@ class Engine(object):
       self.style = style
       self.style_midi = style_midi
 
+      self.nharmonics = nharmonics
+      self.tuning_freq = tuning_freq
+      self.interval=interval
+      self.feature_path = feature_path
 
       #time_shifts=[0.]
       intensity_shifts=list(range(len(self.allowed_dynamics)))
@@ -93,22 +97,29 @@ class Engine(object):
       c = np.array(combo)
       chunk_size = self.chunk_size
       db = self.db
+      feature_path = self.feature_path
 
       tt=transformFFT(frameSize=4096, hopSize=512, sampleRate=44100, window=blackmanharris)
-
       maxLength=0
       for i in range(len(self.sources)):
-        instlen = int(util.getMidiLength(self.sources_midi[i]+'_g'+self.style_midi[s],os.path.join(db,f)))
+        instlen = util.getMidiLength(self.sources_midi[i]+'_g'+self.style_midi,db)
         if instlen>maxLength:
           maxLength = instlen
       if chunk_size>maxLength:
         chunk_size = maxLength
 
       for chnk in range(int(np.floor(maxLength/chunk_size))):
-        chunk_start = chunk_size * chnk
-        chunk_end = (chnk+1) * chunk_size
-        if not os.path.isfile(os.path.join(feature_path,f,self.style[s],f+'_'+str(c)+'_'+str(chnk)+'.data')):
+        chunk_start = float(chunk_size * chnk)
+        chunk_end = float((chnk+1) * chunk_size)
+        if not os.path.isfile(os.path.join(feature_path,self.style,str(c).encode('base64','strict')+'_'+str(chnk)+'.data')):
           try:
+            nelem_g=1
+            for i in range(len(self.sources)):
+                ng = util.getMidiNum(self.sources_midi[i]+'_g'+self.style_midi,db,chunk_start,chunk_end)
+                nelem_g = np.maximum(ng,nelem_g)
+            melody_g = np.zeros((len(self.sources),int(nelem_g),2*self.nharmonics+3))
+            melody_e = np.zeros((len(self.sources),int(nelem_g),2*self.nharmonics+3))
+
             for i in range(len(self.sources)):
 
               nframes = int(np.ceil(chunk_size*self.sampleRate / np.double(tt.hopSize))) + 2
@@ -119,39 +130,45 @@ class Engine(object):
               if i==0:
                   audio = np.zeros((size,len(self.sources)+1))
 
-              melody,melodyBegin,melodyEnd,melNotes = util.getMidi(self.sources_midi[i]+'_g'+self.style_midi[s],os.path.join(db,f),chunk_start,chunk_end,self.sampleRate,tt.hopSize,tt.frameSize,c[i,0],c[i,0],nframes,1)
-
+              tmp = util.expandMidi(self.sources_midi[i]+'_g'+self.style_midi,db,chunk_start,chunk_end,self.interval,self.tuning_freq,self.nharmonics,self.sampleRate,tt.hopSize,tt.frameSize,c[i,0],c[i,0],nframes)
+              melody_g[i,:tmp.shape[0],:] = tmp
+              tmp = None
+              tmp = util.expandMidi(self.sources_midi[i]+'_g'+self.style_midi,db,chunk_start,chunk_end,self.interval,self.tuning_freq,self.nharmonics,self.sampleRate,tt.hopSize,tt.frameSize,c[i,0]+0.2,c[i,0]+0.2,nframes,fermata=c[i,0]+0.5)
+              melody_e[i,:tmp.shape[0],:] = tmp
+              tmp = None
               #generate the audio, note by note
-              for m in range(len(melNotes)):
-                note = self.instruments[i].getNote(melNotes[m],self.allowed_dynamics[int(c[i,1])],self.allowed_styles[int(c[i,2])],int(c[i,3]))
-                if note is None:
-                  raise GetOutOfLoop
-                else:
-                  segment = note.getAudio(max_duration=melodyEnd[m]-melodyBegin[m])
-                  if len(segment)>(len(audio)-int(np.floor(melodyBegin[m]*self.sampleRate))):
-                    audio[int(np.floor(melodyBegin[m]*self.sampleRate)):int(np.floor(melodyBegin[m]*self.sampleRate)+len(segment)),i+1] = segment[:len(audio)-int(np.floor(melodyBegin[m]*self.sampleRate))]
+              for m in range(nelem_g):
+                if melody_g[i,m,2]>0:
+                  note = self.instruments[i].getNote(melody_g[i,m,2],self.allowed_dynamics[int(c[i,1])],self.allowed_styles[int(c[i,2])],int(c[i,3]))
+                  if note is None:
+                    raise GetOutOfLoop
                   else:
-                    audio[int(np.floor(melodyBegin[m]*self.sampleRate)):int(np.floor(melodyBegin[m]*self.sampleRate)+len(segment)),i+1] = segment
+                    segment = note.getAudio(max_duration=float(melody_g[i,m,1]-melody_g[i,m,0])*tt.hopSize/self.sampleRate)
+                    if len(segment)>(len(audio)-int(np.floor(melody_g[i,m,0]*tt.hopSize))):
+                      audio[int(np.floor(melody_g[i,m,0]*tt.hopSize)):int(np.floor(melody_g[i,m,0]*tt.hopSize)+len(segment)),i+1] = segment[:len(audio)-int(np.floor(melody_g[i,m,0]*tt.hopSize))]
+                    else:
+                      audio[int(np.floor(melody_g[i,m,0]*tt.hopSize)):int(np.floor(melody_g[i,m,0]*tt.hopSize)+len(segment)),i+1] = segment
+                    segment = None
+                  note = None
                   segment = None
-                note = None
-                segment = None
 
             audio[:,0] = np.sum(audio[:,1:len(self.sources)+1],axis=1)
-
-            tt.compute_transform(audio,os.path.join(feature_path,f,self.style[s],f+'_'+str(c).encode('base64','strict')+'_'+str(chnk)+'.data'),phase=False)
-
+            tt.compute_transform(audio,os.path.join(feature_path,self.style,str(c).encode('base64','strict')+'_'+str(chnk)+'.data'),phase=False)
+            tt.saveTensor(melody_g, '__g_')
+            tt.saveTensor(melody_e, '__e_')
             audio = None
-            melody= None
+            melody_g = None
+            melody_e = None
           except GetOutOfLoop:
             pass
 
-class GetOutOfLoop( Exception ):
+class GetOutOfLoop( Exception):
   pass
 
 
 if __name__ == "__main__":
   if len(sys.argv)>-1:
-    climate.add_arg('--db', help="the Bach10 Sibelius dataset path")
+    climate.add_arg('--db', help="the Bach 10 Sibelius dataset path")
     climate.add_arg('--rwc', help="the rwc instrument sound path with mat and wav subfolders")
     climate.add_arg('--chunk_size', help="the chunk size to split the midi")
     climate.add_arg('--sample_size', help="sample this number of combinations of possible cases")
@@ -164,23 +181,20 @@ if __name__ == "__main__":
     else:
       db='/home/marius/Documents/Database/Bach10/Source separation/'
       # db='/Volumes/Macintosh HD 2/Documents/Database/Bach10/Source separation/'
-
     if kwargs.__getattribute__('rwc'):
       rwc_path = kwargs.__getattribute__('rwc')
     else:
       rwc_path='/home/marius/Documents/Database/RWC/'
       # rwc_path='/Volumes/Macintosh HD 2/Documents/Database/RWC/'
-
     if kwargs.__getattribute__('chunk_size'):
         chunk_size = float(kwargs.__getattribute__('chunk_size'))
     else:
-        chunk_size = 45
+        chunk_size = 45.0
 
     if kwargs.__getattribute__('nprocs'):
         nprocs = int(kwargs.__getattribute__('nprocs'))
     else:
         nprocs = multiprocessing.cpu_count()-1
-
     if kwargs.__getattribute__('sample_size'):
         sample_size = float(kwargs.__getattribute__('sample_size'))
     else:
@@ -214,6 +228,10 @@ if __name__ == "__main__":
     allowed_case = [1,2,3]
     instrument_nums=[30,31,27,15]
 
+    nharmonics=20
+    interval=50 #cents
+    tuning_freq=440 #Hz
+
     instruments = []
     for ins in range(len(instrument_nums)):
         instruments.append(rwc.Instrument(rwc_path,instrument_nums[ins],allowed_styles,allowed_case,allowed_dynamics))
@@ -227,7 +245,7 @@ if __name__ == "__main__":
               if not os.path.exists(os.path.join(feature_path,f,style[s])):
                   os.makedirs(os.path.join(feature_path,f,style[s]))
 
-              engine = Engine(db,feature_path,instruments,allowed_styles,allowed_dynamics,allowed_case,time_shifts,rwc_path,chunk_size,sample_size,style,style_midi)
+              engine = Engine(os.path.join(db,f),os.path.join(feature_path,f),instruments,allowed_styles,allowed_dynamics,allowed_case,time_shifts,rwc_path,chunk_size,sample_size,style[s],style_midi[s],nharmonics,interval,tuning_freq)
               combos = engine.getCombos()
               print len(combos)
               try:
